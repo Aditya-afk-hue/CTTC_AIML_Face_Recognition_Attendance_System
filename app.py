@@ -1,16 +1,14 @@
-# app.py (Final Version with Automatic Stop)
-
 import os
 import cv2
 import pickle
 import numpy as np
 import streamlit as st
-import time
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from keras.models import Sequential, load_model
 from keras.layers import Conv2D, MaxPooling2D, Flatten, Dense
 from keras.utils import to_categorical
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 import sqlite3
 import pandas as pd
 from datetime import datetime, timedelta
@@ -117,241 +115,94 @@ st.title("Face Recognition Attendance System ✅")
 st.sidebar.title("Menu")
 selected = st.sidebar.selectbox("Choose an option", ["Mark Attendance", "View Attendance", "Collect Data", "Train Model"])
 
-# --- UI Section: Collect Data ---
 if selected == "Collect Data":
     st.header("Collect Face Data 🧑‍🤝‍🧑")
-    name = st.text_input("Enter the person's name:", key="collect_name")
+    st.warning("Data collection uses your local webcam and is not available on the deployed app. Please run this locally.")
 
-    if not name:
-        st.warning("Please enter a name before starting collection.")
-        st.stop()
-    
-    person_dir = os.path.join(IMAGES_DIR, name)
-    os.makedirs(person_dir, exist_ok=True)
-
-    if 'collecting' not in st.session_state:
-        st.session_state.collecting = False
-    if 'img_count' not in st.session_state:
-        st.session_state.img_count = 0
-    
-    def start_collecting():
-        try:
-            existing_files = [f for f in os.listdir(person_dir) if f.startswith(name + "_") and f.endswith(".jpg")]
-            indices = [int(f.split('_')[-1].split('.')[0]) for f in existing_files]
-            st.session_state.img_count = max(indices) + 1 if indices else 0
-        except Exception as e:
-            st.error(f"Error checking existing images: {e}")
-            st.session_state.img_count = 0
-        st.session_state.collecting = True
-
-    def stop_collecting():
-        st.session_state.collecting = False
-
-    st.info("Press 'Start Collecting' to begin. The camera will stop after 100 images or when you press 'Stop'.")
-    
-    col1, col2 = st.columns(2)
-    col1.button("Start Collecting", on_click=start_collecting, type="primary")
-    col2.button("Stop Collecting", on_click=stop_collecting)
-
-    stframe = st.empty()
-
-    if st.session_state.get('collecting', False):
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            st.error("Could not open video device.")
-        else:
-            while st.session_state.collecting:
-                ret, frame = cap.read()
-                if not ret:
-                    st.error("Failed to grab frame from camera.")
-                    break
-                
-                display_frame = frame.copy()
-                gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = classifier.detectMultiScale(gray_frame, 1.3, 5)
-
-                if len(faces) > 0:
-                    x, y, w, h = faces[0]
-                    cv2.rectangle(display_frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
-                    
-                    if st.session_state.img_count < 100:
-                        face_frame = frame[y:y+h, x:x+w]
-                        file_path = os.path.join(person_dir, f"{name}_{st.session_state.img_count}.jpg")
-                        cv2.imwrite(file_path, face_frame)
-                        st.session_state.img_count += 1
-                    else:
-                        st.warning("Reached 100 images. Stopping collection.")
-                        stop_collecting()
-                
-                progress_text = f"Collected: {st.session_state.img_count}/100"
-                cv2.putText(display_frame, progress_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
-                stframe.image(display_frame, channels="BGR")
-
-            cap.release()
-            st.success(f"Collection stopped. Total images for '{name}': {st.session_state.img_count}")
-            st.rerun()
-
-# --- UI Section: Train Model ---
 elif selected == "Train Model":
-    # (No changes needed here, code is the same as previous version)
     st.header("Train the Recognition Model 🧠")
-    if st.button("Start Training", key="train_button"):
-        with st.spinner("Processing images and training model... This may take a while."):
-            image_data, labels = [], []
-            if not os.path.exists(IMAGES_DIR) or not os.listdir(IMAGES_DIR):
-                 st.error("Image directory is empty. Please collect data first.")
-            else:
-                st.write(f"Scanning `{IMAGES_DIR}` directory...")
-                found_images = False
-                for person_name in os.listdir(IMAGES_DIR):
-                    person_dir = os.path.join(IMAGES_DIR, person_name)
-                    if os.path.isdir(person_dir):
-                        image_files = [f for f in os.listdir(person_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                        if image_files:
-                            st.write(f"- Found {len(image_files)} images for {person_name}")
-                            found_images = True
-                            for img_file in image_files:
-                                try:
-                                    img_path = os.path.join(person_dir, img_file)
-                                    image = cv2.imread(img_path)
-                                    if image is None: continue
-                                    image = cv2.resize(image, (100, 100))
-                                    image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-                                    image_data.append(image)
-                                    labels.append(person_name)
-                                except Exception as e:
-                                    st.warning(f"Error processing {img_path}: {e}")
-                if not found_images or not image_data:
-                    st.error("No valid images found to train.")
-                elif len(set(labels)) < 1:
-                     st.error("Training requires images for at least one person.")
-                else:
-                    images = np.array(image_data, dtype='float32')/255.0
-                    images = images.reshape(images.shape[0], 100, 100, 1)
-                    label_encoder = LabelEncoder()
-                    integer_labels = label_encoder.fit_transform(labels)
-                    categorical_labels = to_categorical(integer_labels)
-                    st.write(f"Found {len(label_encoder.classes_)} unique individuals: {', '.join(label_encoder.classes_)}")
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    with open(LABEL_ENCODER_FILE, 'wb') as f: pickle.dump(label_encoder, f)
-                    st.write(f"Label encoder saved.")
-                    if len(images) < 5: st.error(f"Too few images ({len(images)}) to train."); st.stop()
-                    X_train, X_test, y_train, y_test = train_test_split(images, categorical_labels, test_size=0.2, random_state=42, stratify=categorical_labels)
-                    num_classes = len(label_encoder.classes_)
-                    model = Sequential([
-                        Conv2D(32, (3,3), activation='relu', input_shape=(100,100,1)), MaxPooling2D((2,2)),
-                        Conv2D(64, (3,3), activation='relu'), MaxPooling2D((2,2)),
-                        Flatten(), Dense(128, activation='relu'), Dense(num_classes, activation='softmax')
-                    ])
-                    model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-                    st.write("Starting model training...")
-                    history = model.fit(X_train, y_train, epochs=15, batch_size=32, validation_data=(X_test, y_test), verbose=0)
-                    model.save(MODEL_FILE)
-                    st.success(f"Model training complete and saved.")
-                    st.subheader("Training Performance")
-                    perf_df = pd.DataFrame(history.history).rename(columns={'accuracy':'Training Accuracy', 'val_accuracy': 'Validation Accuracy'})
-                    st.line_chart(perf_df)
-                    st.write(f"Final Validation Accuracy: {perf_df['Validation Accuracy'].iloc[-1]:.2%}")
+    st.warning("Model training is computationally intensive. Please run your `train_model.py` script locally and push the model files to GitHub.")
 
-# --- UI Section: Mark Attendance (Live Recognition) ---
 elif selected == "Mark Attendance":
     st.header("Mark Attendance 👋")
-
-    if 'attendance_marked' not in st.session_state: st.session_state.attendance_marked = False
-    if 'person_name' not in st.session_state: st.session_state.person_name = ""
-    if 'running_recognition' not in st.session_state: st.session_state.running_recognition = False
+    if 'attendance_marked' not in st.session_state:
+        st.session_state.attendance_marked = False
+    if 'person_name' not in st.session_state:
+        st.session_state.person_name = ""
 
     if st.session_state.attendance_marked:
-        st.success(f"Attendance marked for **{st.session_state.person_name}**!")
+        st.success(f"Attendance successfully marked for **{st.session_state.person_name}**!")
+        st.info("You can now navigate away or mark another attendance.")
         if st.button("Mark Another Attendance"):
             st.session_state.attendance_marked = False
             st.session_state.person_name = ""
-            st.session_state.running_recognition = False
             st.rerun()
     else:
+        st.info("Click 'START' to use your browser's webcam for recognition.")
         if not os.path.exists(MODEL_FILE) or not os.path.exists(LABEL_ENCODER_FILE):
-             st.warning("Model not found. Please go to the 'Train Model' tab to train it.")
+            st.warning("Model files not found. Please train the model locally and push the files to your GitHub repository.")
         else:
-            if st.button("Start Camera", type="primary"):
-                st.session_state.running_recognition = True
-                st.rerun()
-            
-            stframe = st.empty()
-
-            if st.session_state.running_recognition:
-                if st.button("Stop Camera"):
-                    st.session_state.running_recognition = False
-                    st.rerun()
-                try:
-                    model = load_model(MODEL_FILE)
-                    with open(LABEL_ENCODER_FILE, 'rb') as f:
-                        label_encoder = pickle.load(f)
-                    
-                    cap = cv2.VideoCapture(0)
-                    if not cap.isOpened():
-                        st.error("Could not open video device.")
-                    else:
-                        st.info("Camera is running... Looking for a face.")
-                        last_log_time, log_message = {}, None
-
-                        while st.session_state.running_recognition:
-                            ret, frame = cap.read()
-                            if not ret:
-                                st.error("Failed to grab frame."); break
+            try:
+                model = load_model(MODEL_FILE)
+                with open(LABEL_ENCODER_FILE, 'rb') as f:
+                    label_encoder = pickle.load(f)
+                
+                class AttendanceVideoTransformer(VideoTransformerBase):
+                    def __init__(self):
+                        super().__init__()
+                        self.last_log_time = {}
+                        self.log_message = None
+                    def transform(self, frame):
+                        img = frame.to_ndarray(format="bgr24")
+                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                        faces = classifier.detectMultiScale(gray, 1.3, 5)
+                        for (x, y, w, h) in faces:
+                            cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                            face = gray[y:y+h, x:x+w]
+                            try:
+                                face_resized = cv2.resize(face, (100, 100))
+                                face_processed = face_resized.reshape(1, 100, 100, 1) / 255.0
+                                prediction = model.predict(face_processed, verbose=0)
+                            except: continue
                             
-                            img = frame.copy()
-                            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                            faces = classifier.detectMultiScale(gray, 1.3, 5)
-
-                            for (x, y, w, h) in faces:
-                                cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 0), 2)
-                                face = gray[y:y+h, x:x+w]
-                                try:
-                                    face_resized = cv2.resize(face, (100, 100))
-                                    face_processed = face_resized.reshape(1, 100, 100, 1) / 255.0
-                                    prediction = model.predict(face_processed, verbose=0)
-                                except: continue
-                                
-                                pred_index = np.argmax(prediction)
-                                confidence = np.max(prediction) * 100
-                                
-                                if confidence >= CONFIDENCE_THRESHOLD:
-                                    pred_label = label_encoder.inverse_transform([pred_index])[0]
-                                    text, text_color = f"{pred_label} ({confidence:.1f}%)", (0, 255, 0)
-                                    
-                                    if not log_message: # Only log once per session
+                            pred_index = np.argmax(prediction)
+                            confidence = np.max(prediction) * 100
+                            
+                            if confidence >= CONFIDENCE_THRESHOLD:
+                                pred_label = label_encoder.inverse_transform([pred_index])[0]
+                                text, text_color = f"{pred_label} ({confidence:.1f}%)", (0, 255, 0)
+                                last_time = self.last_log_time.get(pred_label)
+                                if not self.log_message:
+                                    if not last_time or (datetime.now() - last_time) >= timedelta(minutes=LOG_INTERVAL_MINUTES):
                                         if log_attendance(pred_label, confidence):
+                                            self.last_log_time[pred_label] = datetime.now()
                                             st.session_state.attendance_marked = True
                                             st.session_state.person_name = pred_label
-                                            log_message = f"LOGGED: {pred_label}"
-                                            st.session_state.running_recognition = False
-                                else:
-                                    text, text_color = f"Unknown ({confidence:.1f}%)", (0, 0, 255)
-                                cv2.putText(img, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+                                            self.log_message = f"LOGGED: {pred_label}"
+                            else:
+                                text, text_color = f"Unknown ({confidence:.1f}%)", (0, 0, 255)
+                            cv2.putText(img, text, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
 
-                            if log_message:
-                                font, font_scale, color, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3
-                                text_size = cv2.getTextSize(log_message, font, font_scale, thickness)[0]
-                                text_x = (img.shape[1] - text_size[0]) // 2
-                                text_y = (img.shape[0] + text_size[1]) // 2
-                                cv2.putText(img, log_message, (text_x, text_y), font, font_scale, color, thickness)
-                            
-                            stframe.image(img, channels="BGR")
+                        if self.log_message:
+                            font, font_scale, color, thickness = cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 255, 0), 3
+                            text_size = cv2.getTextSize(self.log_message, font, font_scale, thickness)[0]
+                            text_x = (img.shape[1] - text_size[0]) // 2
+                            text_y = (img.shape[0] + text_size[1]) // 2
+                            cv2.putText(img, self.log_message, (text_x, text_y), font, font_scale, color, thickness)
+                        
+                        return img
 
-                            if log_message:
-                                time.sleep(1.5)
+                webrtc_streamer(
+                    key="attendance", mode=WebRtcMode.SENDRECV,
+                    video_processor_factory=AttendanceVideoTransformer,
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_processing=True,
+                )
+                st.caption("After recognition, click the red 'STOP' button above to finalize.")
+            except Exception as e:
+                st.error(f"An error occurred: {e}")
 
-                        cap.release()
-                        st.rerun()
-                except Exception as e:
-                    st.error(f"An error occurred during recognition: {e}")
-                    st.session_state.running_recognition = False
-            else:
-                st.info("Click 'Start Camera' to begin.")
-
-# --- UI Section: View Attendance ---
 elif selected == "View Attendance":
-    # (No changes needed here, code is the same as previous version)
     st.header("Attendance Records 📊")
     filter_option = st.radio("Filter by:", ("All", "Today", "Date Range"), horizontal=True)
     start_date, end_date = None, None
@@ -366,21 +217,19 @@ elif selected == "View Attendance":
     try:
         attendance_df = get_attendance_data(start_date, end_date)
         if attendance_df.empty:
-            st.info("No records found for the selected period.")
+            st.info("No records found.")
         else:
-            st.dataframe(
-                attendance_df, use_container_width=True,
+            st.dataframe(attendance_df, use_container_width=True,
                 column_config={"confidence": st.column_config.NumberColumn("Confidence", format="%.2f%%")},
-                hide_index=True
-            )
+                hide_index=True)
             csv = attendance_df.to_csv(index=False).encode('utf-8')
-            st.download_button(label="Download data as CSV", data=csv, file_name=f'attendance.csv', mime='text/csv')
+            st.download_button(label="Download as CSV", data=csv, file_name='attendance.csv', mime='text/csv')
         st.subheader("Database Management")
         with st.expander("⚠️ Danger Zone"):
             st.warning("This will permanently delete all attendance records.")
-            if st.button("Clear All Attendance Records", type="primary"):
-                with st.spinner("Clearing database..."): clear_db()
-                st.success("All attendance records have been deleted.")
+            if st.button("Clear All Records", type="primary"):
+                with st.spinner("Clearing..."): clear_db()
+                st.success("All records deleted.")
                 st.rerun()
     except Exception as e:
         st.error(f"Error fetching data: {e}")
