@@ -1,7 +1,8 @@
-streamlit
-pandas
-numpy
-scikit-learn
-tensorflow
-opencv-python-headless
-streamlit-webrtc
+streamlit==1.33.0
+pandas==2.2.1
+numpy==1.26.4
+scikit-learn==1.4.2
+tensorflow==2.15.0
+opencv-python-headless==4.9.0.80
+streamlit-webrtc==0.47.6
+Pillow==10.2.0
