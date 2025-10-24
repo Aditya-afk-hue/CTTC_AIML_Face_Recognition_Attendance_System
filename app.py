@@ -143,7 +143,8 @@ elif selected == "Mark Attendance":
             st.warning("Model files not found. Please train the model locally and push the files to your GitHub repository.")
         else:
             try:
-                model = load_model(MODEL_FILE)
+                # FIX 1: Load model with compile=False to avoid version conflicts
+                model = load_model(MODEL_FILE, compile=False)
                 with open(LABEL_ENCODER_FILE, 'rb') as f:
                     label_encoder = pickle.load(f)
                 
@@ -161,7 +162,9 @@ elif selected == "Mark Attendance":
                             face = gray[y:y+h, x:x+w]
                             try:
                                 face_resized = cv2.resize(face, (100, 100))
-                                face_processed = face_resized.reshape(1, 100, 100, 1) / 255.0
+                                # FIX 2: Add histogram equalization for better accuracy
+                                face_equalized = cv2.equalizeHist(face_resized)
+                                face_processed = face_equalized.reshape(1, 100, 100, 1) / 255.0
                                 prediction = model.predict(face_processed, verbose=0)
                             except: continue
                             
