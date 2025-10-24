@@ -3,7 +3,8 @@ import cv2
 import numpy as np
 import os
 import pickle
-import pandas as pdimport streamlit as st
+import pandas as pd
+import streamlit as st
 import cv2
 import numpy as np
 import os
@@ -1293,5 +1294,6 @@ elif mode == "View Attendance":
 
 else:
     st.error("Invalid mode selected.")
+
 
 
