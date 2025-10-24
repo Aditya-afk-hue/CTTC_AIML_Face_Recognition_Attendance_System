@@ -6,6 +6,10 @@ import pickle
 import pandas as pd
 from datetime import datetime
 import time
+import av  # Required for streamlit-webrtc
+import queue # For passing data between threads
+from streamlit_webrtc import VideoTransformerBase, webrtc_streamer, WebRtcMode
+from threading import Lock # To make operations thread-safe
 
 # --- TensorFlow and Keras for Model Training ---
 # Import only if TensorFlow is installed and needed
@@ -35,6 +39,7 @@ IMG_DIR = 'images'
 MODEL_FILE = 'final_model.h5'
 IMAGES_PKL = os.path.join(DATA_DIR, 'images.p')
 LABELS_PKL = os.path.join(DATA_DIR, 'labels.p')
+LE_PKL = os.path.join(DATA_DIR, 'label_encoder.p')
 ATTENDANCE_LOG = os.path.join(DATA_DIR, 'attendance.csv')
 IMG_SIZE = (100, 100)
 CAPTURE_COUNT = 100 # Number of images to capture per person
@@ -43,12 +48,22 @@ CAPTURE_COUNT = 100 # Number of images to capture per person
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
 
-# Load Haar Cascade Classifier
+# --- Load Haar Cascade Classifier ---
+# This needs to be thread-safe for streamlit-webrtc
+classifier_lock = Lock()
+classifier = None
 try:
-    classifier = cv2.CascadeClassifier(CASCADE_PATH)
-    if classifier.empty():
-        st.error(f"Failed to load Haar Cascade from {CASCADE_PATH}. Make sure the file exists.")
-        st.stop()
+    with classifier_lock:
+        # Check if file exists before loading
+        if not os.path.exists(CASCADE_PATH):
+            st.error(f"Haar Cascade file not found at {CASCADE_PATH}. Please upload it.")
+            st.stop()
+        
+        classifier = cv2.CascadeClassifier(CASCADE_PATH)
+        
+        if classifier.empty():
+            st.error(f"Failed to load Haar Cascade from {CASCADE_PATH}. The file might be corrupt or invalid.")
+            st.stop()
 except Exception as e:
     st.error(f"Error loading Haar Cascade: {e}")
     st.stop()
@@ -60,12 +75,9 @@ def preprocess_image(img, target_size=IMG_SIZE):
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         resized = cv2.resize(gray, target_size)
-        # Optional: Histogram Equalization (can sometimes improve contrast)
-        # equalized = cv2.equalizeHist(resized)
-        # return equalized
         return resized
     except cv2.error as e:
-        st.warning(f"Image processing error: {e}. Skipping frame.")
+        # st.warning(f"Image processing error: {e}. Skipping frame.")
         return None
 
 def preprocess_for_model(img):
@@ -87,6 +99,8 @@ def load_attendance():
     if os.path.exists(ATTENDANCE_LOG):
         try:
             return pd.read_csv(ATTENDANCE_LOG)
+        except pd.errors.EmptyDataError:
+             return pd.DataFrame(columns=['Name', 'Timestamp']) # File is empty
         except Exception as e:
             st.error(f"Error loading attendance log: {e}")
             return pd.DataFrame(columns=['Name', 'Timestamp'])
@@ -100,26 +114,38 @@ def save_attendance(df):
     except Exception as e:
         st.error(f"Error saving attendance log: {e}")
 
-def mark_attendance(name, attendance_df):
-    """Adds an attendance entry if the person hasn't been marked recently."""
+# Use session state to manage attendance dataframe and last marked times
+if 'attendance_df' not in st.session_state:
+    st.session_state.attendance_df = load_attendance()
+if 'last_marked' not in st.session_state:
+    st.session_state.last_marked = {}
+if 'attendance_needs_update' not in st.session_state:
+    st.session_state.attendance_needs_update = False
+
+# This lock will protect access to the attendance dataframe and last_marked dict
+attendance_lock = Lock()
+
+def mark_attendance(name):
+    """Adds an attendance entry if the person hasn't been marked recently (e.g., 5 min)."""
     now = datetime.now()
-    today_str = now.strftime('%Y-%m-%d')
     timestamp_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-    # Check if already marked today (simple check, could be more sophisticated)
-    if name in attendance_df['Name'].values:
-        last_entry_time_str = attendance_df[attendance_df['Name'] == name]['Timestamp'].iloc[-1]
-        last_entry_date = datetime.strptime(last_entry_time_str, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%d')
-        if last_entry_date == today_str:
-            # st.info(f"{name} already marked today at {last_entry_time_str}.")
-            return attendance_df # No change
+    with attendance_lock:
+        # Check if marked recently
+        last_time = st.session_state.last_marked.get(name)
+        if last_time and (now - last_time).total_seconds() < 300: # 5 minute cooldown
+            return False # Not marked
 
-    # Add new entry using pd.concat
-    new_entry = pd.DataFrame({'Name': [name], 'Timestamp': [timestamp_str]})
-    attendance_df = pd.concat([attendance_df, new_entry], ignore_index=True)
-    st.success(f"Attendance marked for {name} at {timestamp_str}")
-    save_attendance(attendance_df)
-    return attendance_df
+        # Add new entry
+        new_entry = pd.DataFrame({'Name': [name], 'Timestamp': [timestamp_str]})
+        st.session_state.attendance_df = pd.concat([st.session_state.attendance_df, new_entry], ignore_index=True)
+        st.session_state.last_marked[name] = now # Update last marked time
+        
+        save_attendance(st.session_state.attendance_df)
+        st.session_state.attendance_needs_update = True # Flag for main thread to update UI
+    
+    st.toast(f"Attendance marked for {name} at {timestamp_str}") # Use toast for less intrusive notice
+    return True # Marked
 
 
 # --- Streamlit App UI ---
@@ -128,18 +154,20 @@ st.title("Face Recognition Attendance System")
 
 # --- Sidebar for Mode Selection ---
 st.sidebar.title("Mode")
-mode = st.sidebar.radio("Select Operation:", ["Home", "Collect Data", "Consolidate Data", "Train Model", "Recognize & Mark Attendance"])
+mode = st.sidebar.radio("Select Operation:", ["Home", "Collect Data", "Consolidate Data", "Train Model", "Recognize & Mark Attendance", "View Attendance"])
 
 if mode == "Home":
     st.header("Welcome!")
     st.write("""
         Select a mode from the sidebar to:
-        1.  **Collect Data:** Register faces of new individuals.
+        1.  **Collect Data:** Register faces of new individuals using your browser's webcam.
         2.  **Consolidate Data:** Process collected images for training.
         3.  **Train Model:** Train the face recognition model (requires collected data).
-        4.  **Recognize & Mark Attendance:** Start the camera to recognize faces and log attendance.
+        4.  **Recognize & Mark Attendance:** Start your camera to recognize faces and log attendance.
+        5.  **View Attendance:** View and clear the attendance log.
     """)
     st.info(f"Make sure `{CASCADE_PATH}` is in the same directory as this script.")
+    st.info(f"This app uses `streamlit-webrtc` to access your browser's camera. Please grant camera permissions when prompted.")
     if TENSORFLOW_AVAILABLE:
         st.success("TensorFlow/Keras found.")
     else:
@@ -149,110 +177,102 @@ if mode == "Home":
 elif mode == "Collect Data":
     st.header("Collect Face Data")
     name = st.text_input("Enter Person's Name:", key="collect_name").strip().lower()
-    url_input = st.text_input("Enter IP Camera URL (or 0 for webcam):", "0", key="collect_url")
-    start_capture = st.button("Start Capture", key="start_capture_btn")
 
-    if 'capture_active' not in st.session_state:
-        st.session_state.capture_active = False
-    if 'captured_count' not in st.session_state:
-        st.session_state.captured_count = 0
-    if 'face_data_buffer' not in st.session_state:
-        st.session_state.face_data_buffer = []
+    # We use session state to track the count across reruns
+    if 'capture_count' not in st.session_state:
+        st.session_state.capture_count = 0
 
-    if start_capture and not name:
-        st.warning("Please enter a name.")
-    elif start_capture and name:
-        st.session_state.capture_active = True
-        st.session_state.captured_count = 0
-        st.session_state.face_data_buffer = []
-        st.info(f"Starting capture for {name}. Press 'Stop Capture' below the video feed.")
+    capture_lock = Lock()
+    
+    class VideoCollector(VideoTransformerBase):
+        def __init__(self, person_name, capture_limit):
+            self.person_name = person_name
+            self.capture_limit = capture_limit
+            # Use session state for the counter
+            st.session_state.capture_count = 0
+        
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            with capture_lock:
+                current_count = st.session_state.capture_count
+            
+            if current_count >= self.capture_limit:
+                # Once limit is reached, just return the frame
+                img = frame.to_ndarray(format="bgr24")
+                cv2.putText(img, f"Capture Complete: {current_count}/{self.capture_limit}", 
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-    frame_placeholder = st.empty()
-    progress_bar = st.progress(0)
-    progress_text = st.empty()
-
-    if st.session_state.capture_active:
-        stop_capture = st.button("Stop Capture", key="stop_capture_btn")
-        if stop_capture:
-            st.session_state.capture_active = False
-            st.warning("Capture stopped.")
-            # Save any remaining buffered data if needed (optional)
-            if st.session_state.face_data_buffer:
-                 st.write(f"Saving {len(st.session_state.face_data_buffer)} buffered images...")
-                 for i, face_img in enumerate(st.session_state.face_data_buffer):
-                     filename = os.path.join(IMG_DIR, f"{name}_{st.session_state.captured_count + i}.jpg")
-                     cv2.imwrite(filename, face_img)
-                 st.session_state.captured_count += len(st.session_state.face_data_buffer)
-                 st.session_state.face_data_buffer = [] # Clear buffer
-                 progress_bar.progress(1.0)
-                 progress_text.text(f"Capture complete: {st.session_state.captured_count}/{CAPTURE_COUNT}")
+            img = frame.to_ndarray(format="bgr24")
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            faces = []
+            with classifier_lock:
+                if not classifier.empty():
+                    faces = classifier.detectMultiScale(gray, 1.3, 5)
+                else:
+                    # This should not happen based on startup check, but as a safeguard
+                    print("Classifier not loaded in transform thread.")
 
 
-        # Determine video source
-        try:
-            video_source = int(url_input) if url_input.isdigit() else url_input
-            cap = cv2.VideoCapture(video_source)
-            if not cap.isOpened():
-                st.error(f"Error: Could not open video source '{url_input}'. Check the URL or camera index.")
-                st.session_state.capture_active = False
-        except Exception as e:
-            st.error(f"Error initializing video capture: {e}")
-            st.session_state.capture_active = False
+            found_face = False
+            for (x, y, w, h) in faces:
+                # Draw rectangle on the *original* color image
+                cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+                
+                if current_count < self.capture_limit:
+                    face_roi = img[y:y+h, x:x+w]
+                    filename = os.path.join(IMG_DIR, f"{self.person_name}_{current_count}.jpg")
+                    try:
+                        cv2.imwrite(filename, face_roi)
+                        with capture_lock:
+                            st.session_state.capture_count += 1
+                            current_count = st.session_state.capture_count
+                    except Exception as e:
+                        print(f"Error saving image: {e}") # Log to console
+                
+                found_face = True
+                break # Only capture one face per frame
+            
+            # Add count to the frame
+            cv2.putText(img, f"Captured: {current_count}/{self.capture_limit}", 
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-        while st.session_state.capture_active and 'cap' in locals() and cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                st.warning("Failed to grab frame. Stopping capture.")
-                st.session_state.capture_active = False
-                break
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-            # Convert frame to RGB for Streamlit display
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if not name:
+        st.warning("Please enter a name before starting.")
+    else:
+        st.info(f"Preparing to capture {CAPTURE_COUNT} images for '{name}'.")
+        st.info("The video stream will start. Allow camera access in your browser.")
+        
+        webrtc_ctx = webrtc_streamer(
+            key="collect",
+            mode=WebRtcMode.SENDRECV,
+            video_transformer_factory=lambda: VideoCollector(name, CAPTURE_COUNT),
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
 
-            faces = classifier.detectMultiScale(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), 1.3, 5)
+        progress_bar = st.progress(0.0)
+        progress_text = st.empty()
 
-            capture_this_frame = False
-            if len(faces) > 0:
-                # Assuming only one face is needed per frame for collection
-                x, y, w, h = faces[0]
-                face_frame = frame[y:y+h, x:x+w]
-                cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (0, 255, 0), 2) # Draw on RGB frame
-
-                if st.session_state.captured_count < CAPTURE_COUNT:
-                     # Add to buffer instead of writing immediately
-                    st.session_state.face_data_buffer.append(face_frame)
-                    capture_this_frame = True
-                    # Optional: Save in batches to reduce I/O frequency
-                    if len(st.session_state.face_data_buffer) >= 10: # Save every 10 frames
-                         st.write(f"Saving buffer ({len(st.session_state.face_data_buffer)} images)...")
-                         for i, face_img in enumerate(st.session_state.face_data_buffer):
-                             filename = os.path.join(IMG_DIR, f"{name}_{st.session_state.captured_count + i}.jpg")
-                             cv2.imwrite(filename, face_img)
-                         st.session_state.captured_count += len(st.session_state.face_data_buffer)
-                         st.session_state.face_data_buffer = [] # Clear buffer
-
-            # Update progress
-            progress = st.session_state.captured_count / CAPTURE_COUNT
+        while webrtc_ctx.state.playing:
+            with capture_lock:
+                current_count = st.session_state.capture_count
+            
+            progress = current_count / CAPTURE_COUNT if CAPTURE_COUNT > 0 else 0
             progress_bar.progress(progress)
-            progress_text.text(f"Captured: {st.session_state.captured_count}/{CAPTURE_COUNT}")
+            progress_text.text(f"Captured: {current_count}/{CAPTURE_COUNT}")
+            
+            if current_count >= CAPTURE_COUNT:
+                progress_bar.progress(1.0)
+                progress_text.success(f"Capture complete for {name}!")
+                break # Stop the status update loop
+            
+            time.sleep(0.1) # Poll for updates
 
-            # Display the frame
-            frame_placeholder.image(frame_rgb, channels="RGB", use_column_width=True)
+        st.caption("Press the 'STOP' button on the video stream when done.")
 
-            if st.session_state.captured_count >= CAPTURE_COUNT:
-                st.success(f"Successfully captured {CAPTURE_COUNT} images for {name}.")
-                st.session_state.capture_active = False
-
-            # Add a small delay to prevent Streamlit from overwhelming the browser
-            time.sleep(0.01)
-
-        if 'cap' in locals():
-            cap.release()
-            cv2.destroyAllWindows() # Just in case
-
-    elif not st.session_state.capture_active and st.session_state.captured_count > 0:
-        st.info(f"Capture finished. {st.session_state.captured_count} images saved for {name}.")
-        st.session_state.captured_count = 0 # Reset for next capture
 
 # --- Mode: Consolidate Data ---
 elif mode == "Consolidate Data":
@@ -278,6 +298,7 @@ elif mode == "Consolidate Data":
 
                     processed_image = preprocess_image(image, target_size=IMG_SIZE)
                     if processed_image is None:
+                        st.warning(f"Could not process image: {filename}. Skipping.")
                         continue
 
                     label = filename.split("_")[0] # Extract label (name) from filename
@@ -291,7 +312,6 @@ elif mode == "Consolidate Data":
                 # Update progress bar
                 consolidation_progress.progress((i + 1) / len(image_files))
 
-
             if not image_data or not labels:
                  st.error("No images could be processed successfully.")
             else:
@@ -300,7 +320,12 @@ elif mode == "Consolidate Data":
 
                 st.write(f"Data shape: {image_data_np.shape}")
                 st.write(f"Labels shape: {labels_np.shape}")
-                st.write(f"Unique labels found: {np.unique(labels_np)}")
+                unique_labels = np.unique(labels_np)
+                st.write(f"Unique labels found: {unique_labels} ({len(unique_labels)} classes)")
+
+
+                if len(unique_labels) < 2:
+                    st.warning("Warning: Only one person's data found. The model needs at least two people to train effectively.")
 
                 try:
                     with open(IMAGES_PKL, 'wb') as f:
@@ -343,11 +368,9 @@ elif mode == "Train Model":
                     num_classes = labels_categorical.shape[1]
 
                     # Save the label encoder
-                    le_path = os.path.join(DATA_DIR, 'label_encoder.p')
-                    with open(le_path, 'wb') as f:
+                    with open(LE_PKL, 'wb') as f:
                         pickle.dump(le, f)
-                    st.info(f"Label encoder saved to {le_path}")
-
+                    st.info(f"Label encoder saved to {LE_PKL}")
 
                     # Preprocess images for CNN
                     images_processed = images.reshape(images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 1)
@@ -374,19 +397,44 @@ elif mode == "Train Model":
                     ])
 
                     model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
-                    model.summary(print_fn=st.text) # Display model summary in Streamlit
+                    
+                    # Print summary to a string and display in Streamlit
+                    stringlist = []
+                    model.summary(print_fn=lambda x: stringlist.append(x))
+                    st.text("\n".join(stringlist))
 
                     st.info("Training model...")
-                    # Use st.empty to show progress dynamically (optional, requires callbacks)
+                    
                     training_status = st.empty()
                     training_status.write("Starting training...")
-                    history = model.fit(X_train, y_train, epochs=15, batch_size=32, validation_split=0.1, verbose=0) # verbose=0 for less console output
+                    
+                    # Use a Keras callback to update streamlit in intervals
+                    class StreamlitCallback(tf.keras.callbacks.Callback):
+                        def on_epoch_end(self, epoch, logs=None):
+                            logs = logs or {}
+                            acc = logs.get('accuracy', 0)
+                            val_acc = logs.get('val_accuracy', 0)
+                            loss = logs.get('loss', 0)
+                            val_loss = logs.get('val_loss', 0)
+                            training_status.write(
+                                f"Epoch {epoch+1}/{self.params['epochs']} - "
+                                f"Loss: {loss:.4f}, Acc: {acc:.4f} - "
+                                f"Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}"
+                            )
+
+                    history = model.fit(X_train, y_train, 
+                                        epochs=20, 
+                                        batch_size=32, 
+                                        validation_data=(X_test, y_test), 
+                                        callbacks=[StreamlitCallback()],
+                                        verbose=0) 
+                    
                     training_status.success("Training finished!")
 
                     # Evaluate model
                     loss, accuracy = model.evaluate(X_test, y_test, verbose=0)
-                    st.write(f"Test Loss: {loss:.4f}")
-                    st.write(f"Test Accuracy: {accuracy:.4f}")
+                    st.write(f"Final Test Loss: {loss:.4f}")
+                    st.write(f"Final Test Accuracy: {accuracy:.4f}")
 
                     # Plot training history (optional)
                     try:
@@ -400,7 +448,6 @@ elif mode == "Train Model":
                         st.pyplot(fig)
                     except ImportError:
                         st.info("Matplotlib not found, skipping accuracy plot.")
-
 
                     # Save model
                     model.save(MODEL_FILE)
@@ -423,122 +470,173 @@ elif mode == "Recognize & Mark Attendance":
     try:
         if os.path.exists(MODEL_FILE):
             model = load_model(MODEL_FILE)
-            st.info(f"Recognition model '{MODEL_FILE}' loaded.")
         else:
             st.warning(f"Model file '{MODEL_FILE}' not found. Please train the model first.")
 
-        le_path = os.path.join(DATA_DIR, 'label_encoder.p')
-        if os.path.exists(le_path):
-            with open(le_path, 'rb') as f:
+        if os.path.exists(LE_PKL):
+            with open(LE_PKL, 'rb') as f:
                 label_encoder = pickle.load(f)
-            st.info(f"Label encoder loaded. Classes: {label_encoder.classes_}")
+            st.info(f"Label encoder loaded. Classes: {list(label_encoder.classes_)}")
         else:
-            st.warning("Label encoder not found. Please train the model first.")
+            st.warning(f"Label encoder '{LE_PKL}' not found. Please train the model first.")
 
     except Exception as e:
         st.error(f"Error loading model or label encoder: {e}")
         model = None # Ensure model is None if loading failed
 
-    # --- Attendance Log ---
-    attendance_df = load_attendance()
-    st.subheader("Attendance Log")
-    st.dataframe(attendance_df, use_container_width=True)
+    # --- Attendance Log Display ---
+    st.subheader("Today's Attendance")
+    
+    # We need a placeholder to update the dataframe
+    attendance_placeholder = st.empty()
+    
+    def display_attendance():
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        with attendance_lock:
+            # Reload from disk to ensure consistency
+            current_attendance_df = load_attendance()
+            st.session_state.attendance_df = current_attendance_df
+            
+            df_to_display = current_attendance_df[
+                pd.to_datetime(current_attendance_df['Timestamp']).dt.strftime('%Y-%m-%d') == today_str
+            ]
+        attendance_placeholder.dataframe(df_to_display, use_container_width=True)
 
-    # --- Real-time Recognition ---
-    url_input_rec = st.text_input("Enter IP Camera URL (or 0 for webcam):", "0", key="rec_url")
-    start_rec = st.button("Start Recognition", key="start_rec_btn", disabled=(model is None or label_encoder is None))
+    display_attendance() # Initial display
+    
+    # --- Result Queue ---
+    # This queue will hold recognized names from the video thread
+    result_queue = queue.Queue()
 
-    if 'rec_active' not in st.session_state:
-        st.session_state.rec_active = False
+    # --- Video Transformer Class ---
+    class VideoRecognizer(VideoTransformerBase):
+        def __init__(self, model, le, queue_out):
+            self.model = model
+            self.label_encoder = le
+            self.queue_out = queue_out
+            self.confidence_threshold = 0.70 # 70% confidence
 
-    if start_rec:
-        st.session_state.rec_active = True
-        st.info("Starting recognition. Press 'Stop Recognition' below the video feed.")
+        def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            if self.model is None or self.label_encoder is None:
+                return frame # Pass through if model not loaded
+            
+            img = frame.to_ndarray(format="bgr24")
+            img_rgb = img # Keep color for display
+            img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    rec_frame_placeholder = st.empty()
-
-    if st.session_state.rec_active:
-        stop_rec = st.button("Stop Recognition", key="stop_rec_btn")
-        if stop_rec:
-            st.session_state.rec_active = False
-            st.warning("Recognition stopped.")
-
-        try:
-            video_source_rec = int(url_input_rec) if url_input_rec.isdigit() else url_input_rec
-            cap_rec = cv2.VideoCapture(video_source_rec)
-            if not cap_rec.isOpened():
-                st.error(f"Error: Could not open video source '{url_input_rec}'.")
-                st.session_state.rec_active = False
-        except Exception as e:
-            st.error(f"Error initializing video capture: {e}")
-            st.session_state.rec_active = False
-
-        while st.session_state.rec_active and 'cap_rec' in locals() and cap_rec.isOpened():
-            ret, frame = cap_rec.read()
-            if not ret:
-                st.warning("Failed to grab frame. Stopping recognition.")
-                st.session_state.rec_active = False
-                break
-
-            frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) # For display
-
-            faces = classifier.detectMultiScale(frame_gray, 1.3, 5)
+            faces = []
+            with classifier_lock:
+                if not classifier.empty():
+                    faces = classifier.detectMultiScale(img_gray, 1.3, 5)
+                else:
+                    print("Classifier not loaded in transform thread.")
 
             for (x, y, w, h) in faces:
-                face_roi_gray = frame_gray[y:y+h, x:x+w]
+                face_roi_gray = img_gray[y:y+h, x:x+w]
+                
+                # Ensure ROI is valid
+                if face_roi_gray.size == 0:
+                    continue
+                    
                 face_roi_resized = cv2.resize(face_roi_gray, IMG_SIZE)
 
-                # Preprocess for model
                 processed_face = preprocess_for_model(face_roi_resized)
 
-                if processed_face is not None and model is not None and label_encoder is not None:
-                    # Predict
-                    prediction = model.predict(processed_face, verbose=0) # verbose=0 hides prediction progress bar
-                    confidence = np.max(prediction)
-                    predicted_class_index = np.argmax(prediction)
+                if processed_face is not None:
+                    try:
+                        # Predict
+                        prediction = self.model.predict(processed_face, verbose=0)
+                        confidence = np.max(prediction)
+                        predicted_class_index = np.argmax(prediction)
 
-                    # Set a confidence threshold (e.g., 70%)
-                    confidence_threshold = 0.70
+                        if confidence > self.confidence_threshold:
+                            predicted_label = self.label_encoder.inverse_transform([predicted_class_index])[0]
+                            display_text = f"{predicted_label} ({confidence*100:.1f}%)"
+                            color = (0, 255, 0) # Green
 
-                    if confidence > confidence_threshold:
-                        predicted_label = label_encoder.inverse_transform([predicted_class_index])[0]
-                        display_text = f"{predicted_label} ({confidence*100:.1f}%)"
-                        color = (0, 255, 0) # Green for confident prediction
+                            # Put the recognized name in the queue for the main thread
+                            self.queue_out.put(predicted_label)
+                        else:
+                            display_text = f"Unknown ({confidence*100:.1f}%)"
+                            color = (0, 0, 255) # Red
 
-                        # Mark attendance (function handles duplicates)
-                        attendance_df = mark_attendance(predicted_label, attendance_df)
-                        # Refresh displayed dataframe - this causes a flicker, better to update less often or differently
-                        # st.dataframe(attendance_df, use_container_width=True) # Re-display updated df
+                        # Draw rectangle and text
+                        cv2.rectangle(img_rgb, (x, y), (x+w, y+h), color, 2)
+                        cv2.putText(img_rgb, display_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                    except Exception as e:
+                        print(f"Error during prediction or drawing: {e}") # Log to console
+            
+            return av.VideoFrame.from_ndarray(img_rgb, format="bgr24")
 
-                    else:
-                        predicted_label = "Unknown"
-                        display_text = f"Unknown ({confidence*100:.1f}%)"
-                        color = (0, 0, 255) # Red for unknown/low confidence
+    # --- Start Video Stream ---
+    if model and label_encoder:
+        st.info("Allow camera access in your browser. Recognition is active.")
+        webrtc_ctx = webrtc_streamer(
+            key="recognize",
+            mode=WebRtcMode.SENDRECV,
+            video_transformer_factory=lambda: VideoRecognizer(model, label_encoder, result_queue),
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
 
-                    # Draw rectangle and text on the RGB frame
-                    cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), color, 2)
-                    cv2.putText(frame_rgb, display_text, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # Main loop to check queue and update attendance
+        if webrtc_ctx.state.playing:
+            while webrtc_ctx.state.playing:
+                if st.session_state.attendance_needs_update:
+                    display_attendance()
+                    with attendance_lock:
+                        st.session_state.attendance_needs_update = False
+                
+                try:
+                    # Check for new names in the queue
+                    name = result_queue.get(timeout=0.1) # Poll for 100ms
+                    marked = mark_attendance(name)
+                    
+                    if marked:
+                        # The flag will be set inside mark_attendance
+                        pass
 
-                else:
-                    # Draw basic rectangle if processing failed
-                    cv2.rectangle(frame_rgb, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                except queue.Empty:
+                    pass # No new name, just loop and check flag
+                
+                # A short sleep to prevent a busy-loop
+                time.sleep(0.1) 
+        else:
+            # When stream stops, check for any final updates
+            if st.session_state.attendance_needs_update:
+                display_attendance()
+                with attendance_lock:
+                    st.session_state.attendance_needs_update = False
+            
+    else:
+        st.error("Cannot start recognition. Model or Label Encoder not loaded.")
+        st.write("Please go to 'Train Model' and train a model first.")
 
+# --- Mode: View Attendance ---
+elif mode == "View Attendance":
+    st.header("Full Attendance Log")
+    
+    # Button to refresh data
+    if st.button("Refresh Log"):
+        st.session_state.attendance_df = load_attendance()
+    
+    st.dataframe(st.session_state.attendance_df, use_container_width=True)
 
-            # Display the frame in Streamlit
-            rec_frame_placeholder.image(frame_rgb, channels="RGB", use_column_width=True)
-
-            # Optional: Short delay
-            time.sleep(0.01)
-
-        if 'cap_rec' in locals():
-            cap_rec.release()
-            cv2.destroyAllWindows()
-
-        # Update the dataframe display one last time after stopping
-        if not st.session_state.rec_active:
-             st.dataframe(attendance_df, use_container_width=True)
-
+    if st.button("Clear Full Attendance Log", key="clear_attendance_btn", type="primary"):
+        if os.path.exists(ATTENDANCE_LOG):
+            try:
+                os.remove(ATTENDANCE_LOG)
+                with attendance_lock:
+                    st.session_state.attendance_df = load_attendance() # Reload empty df
+                    st.session_state.last_marked = {} # Reset cooldowns
+                st.success("Attendance log cleared.")
+                time.sleep(1) # Give time to see message
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not clear log: {e}")
+        else:
+            st.info("Attendance log is already empty.")
 
 else:
     st.error("Invalid mode selected.")
+
