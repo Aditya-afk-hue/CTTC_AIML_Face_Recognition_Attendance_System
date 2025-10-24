@@ -25,6 +25,8 @@ for i in os.listdir(img_dir):
     image = cv2.resize(image, (100, 100))
     # Convert to grayscale
     image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # Apply histogram equalization to improve contrast
+    image = cv2.equalizeHist(image)
     # Add the processed image to our list
     image_data.append(image)
     # Extract the label (name) from the filename (e.g., "shiva_1.jpg" -> "shiva")
