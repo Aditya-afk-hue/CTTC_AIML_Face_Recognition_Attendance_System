@@ -188,8 +188,8 @@ elif mode == "Collect Data":
         def __init__(self, person_name, capture_limit):
             self.person_name = person_name
             self.capture_limit = capture_limit
-            # Use session state for the counter
-            st.session_state.capture_count = 0
+            # --- FIX: DO NOT RESET THE COUNT HERE ---
+            # st.session_state.capture_count = 0 
         
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
             with capture_lock:
@@ -245,6 +245,15 @@ elif mode == "Collect Data":
         st.info(f"Preparing to capture {CAPTURE_COUNT} images for '{name}'.")
         st.info("The video stream will start. Allow camera access in your browser.")
         
+        # --- FIX: Reset count here, *before* the streamer is created ---
+        # This ensures that every time we *start* a new stream, the count is 0.
+        if 'stream_active' not in st.session_state:
+            st.session_state.stream_active = False
+
+        if not st.session_state.stream_active:
+             st.session_state.capture_count = 0
+        # --- End Fix ---
+
         webrtc_ctx = webrtc_streamer(
             key="collect",
             mode=WebRtcMode.SENDRECV,
@@ -256,27 +265,33 @@ elif mode == "Collect Data":
         progress_bar = st.progress(0.0)
         progress_text = st.empty()
 
-        while webrtc_ctx.state.playing:
-            with capture_lock:
-                current_count = st.session_state.capture_count
-            
-            progress = current_count / CAPTURE_COUNT if CAPTURE_COUNT > 0 else 0
-            progress_bar.progress(progress)
-            progress_text.text(f"Captured: {current_count}/{CAPTURE_COUNT}")
-            
-            if current_count >= CAPTURE_COUNT:
-                progress_bar.progress(1.0)
-                progress_text.success(f"Capture complete for {name}!")
+        if webrtc_ctx.state.playing:
+            st.session_state.stream_active = True
+            while True: # Use a true loop that we can break
+                with capture_lock:
+                    current_count = st.session_state.capture_count
                 
-                # --- FIX: Automatically stop the stream ---
-                time.sleep(1) # Pause to show the message
-                st.session_state.capture_count = 0 # Reset for next run
-                st.rerun() # Rerun the script, this will stop/remove the webrtc component
-                # --- End Fix ---
+                progress = current_count / CAPTURE_COUNT if CAPTURE_COUNT > 0 else 0
+                progress_bar.progress(progress)
+                progress_text.text(f"Captured: {current_count}/{CAPTURE_COUNT}")
                 
-                break # Stop the status update loop
-            
-            time.sleep(0.1) # Poll for updates
+                if current_count >= CAPTURE_COUNT:
+                    progress_bar.progress(1.0)
+                    progress_text.success(f"Capture complete for {name}!")
+                    
+                    time.sleep(1.5) # Pause to show the message
+                    st.session_state.stream_active = False
+                    st.rerun() # Rerun the script, this will stop/remove the webrtc component
+                    break # Stop the status update loop
+                
+                if not webrtc_ctx.state.playing: # Check if user stopped it manually
+                    st.session_state.stream_active = False
+                    break
+
+                time.sleep(0.1) # Poll for updates
+        else:
+            st.session_state.stream_active = False
+
 
         st.caption("Press the 'STOP' button on the video stream if you want to stop early.")
 
@@ -591,34 +606,33 @@ elif mode == "Recognize & Mark Attendance":
             async_processing=True,
         )
 
+        # --- FIX: Remove the blocking while loop ---
         # Main loop to check queue and update attendance
-        if webrtc_ctx.state.playing:
-            while webrtc_ctx.state.playing:
-                if st.session_state.attendance_needs_update:
-                    display_attendance()
-                    with attendance_lock:
-                        st.session_state.attendance_needs_update = False
-                
-                try:
-                    # Check for new names in the queue
-                    name = result_queue.get(timeout=0.1) # Poll for 100ms
-                    marked = mark_attendance(name)
-                    
-                    if marked:
-                        # The flag will be set inside mark_attendance
-                        pass
+        # if webrtc_ctx.state.playing:
+        #    while webrtc_ctx.state.playing:
+        # --- END FIX ---
 
-                except queue.Empty:
-                    pass # No new name, just loop and check flag
-                
-                # A short sleep to prevent a busy-loop
-                time.sleep(0.1) 
-        else:
-            # When stream stops, check for any final updates
-            if st.session_state.attendance_needs_update:
-                display_attendance()
-                with attendance_lock:
-                    st.session_state.attendance_needs_update = False
+        # --- FIX: Add non-blocking queue check and rerun ---
+        # This code runs every time the page rerenders
+        try:
+            # Check queue for any new names
+            name = result_queue.get(block=False) 
+            marked = mark_attendance(name)
+            # mark_attendance sets the 'attendance_needs_update' flag
+        except queue.Empty:
+            pass # No new name, just continue
+
+        # If the flag was set (by us or another thread), update the display
+        if st.session_state.attendance_needs_update:
+            display_attendance()
+            with attendance_lock:
+                st.session_state.attendance_needs_update = False
+        
+        # Force a periodic re-run to keep checking the queue
+        if webrtc_ctx.state.playing:
+            time.sleep(0.5) # Poll every 500ms
+            st.rerun()
+        # --- END FIX ---
             
     else:
         st.error("Cannot start recognition. Model or Label Encoder not loaded.")
