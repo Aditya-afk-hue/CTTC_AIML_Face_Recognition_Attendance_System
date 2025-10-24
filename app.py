@@ -114,13 +114,23 @@ def save_attendance(df):
     except Exception as e:
         st.error(f"Error saving attendance log: {e}")
 
-# Use session state to manage attendance dataframe and last marked times
+# --- FIX: Initialize ALL Session State variables at the top ---
 if 'attendance_df' not in st.session_state:
     st.session_state.attendance_df = load_attendance()
 if 'last_marked' not in st.session_state:
     st.session_state.last_marked = {}
 if 'attendance_needs_update' not in st.session_state:
     st.session_state.attendance_needs_update = False
+if 'mode' not in st.session_state:
+    st.session_state.mode = "Home"
+if 'capture_count' not in st.session_state:
+    st.session_state.capture_count = 0
+if 'start_capture' not in st.session_state:
+    st.session_state.start_capture = False
+if 'result_queue' not in st.session_state:
+    st.session_state.result_queue = queue.Queue()
+# --- END FIX ---
+
 
 # This lock will protect access to the attendance dataframe and last_marked dict
 attendance_lock = Lock()
@@ -154,9 +164,6 @@ st.title("Face Recognition Attendance System")
 
 # --- Sidebar for Mode Selection ---
 st.sidebar.title("Mode")
-# --- FIX: Use a session state variable to track the current mode ---
-if 'mode' not in st.session_state:
-    st.session_state.mode = "Home"
 
 def set_mode(mode_name):
     st.session_state.mode = mode_name
@@ -169,7 +176,6 @@ st.sidebar.radio("Select Operation:",
                 )
 
 mode = st.session_state.mode
-# --- END FIX ---
 
 
 if mode == "Home":
@@ -194,12 +200,6 @@ elif mode == "Collect Data":
     st.header("Collect Face Data")
     name = st.text_input("Enter Person's Name:", key="collect_name").strip().lower()
 
-    # We use session state to track the count across reruns
-    if 'capture_count' not in st.session_state:
-        st.session_state.capture_count = 0
-    if 'start_capture' not in st.session_state:
-        st.session_state.start_capture = False
-
     capture_lock = Lock()
     
     class VideoCollector(VideoTransformerBase):
@@ -208,17 +208,17 @@ elif mode == "Collect Data":
             self.capture_limit = capture_limit
         
         def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+            img = frame.to_ndarray(format="bgr24")
+            
             with capture_lock:
                 current_count = st.session_state.capture_count
             
             if current_count >= self.capture_limit:
                 # Once limit is reached, just return the frame
-                img = frame.to_ndarray(format="bgr24")
                 cv2.putText(img, f"Capture Complete: {current_count}/{self.capture_limit}", 
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
                 return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-            img = frame.to_ndarray(format="bgr24")
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             
             faces = []
@@ -226,9 +226,7 @@ elif mode == "Collect Data":
                 if not classifier.empty():
                     faces = classifier.detectMultiScale(gray, 1.3, 5)
                 else:
-                    # This should not happen based on startup check, but as a safeguard
                     print("Classifier not loaded in transform thread.")
-
 
             found_face = False
             for (x, y, w, h) in faces:
@@ -258,7 +256,6 @@ elif mode == "Collect Data":
     if not name:
         st.warning("Please enter a name before starting.")
     else:
-        # --- FIX: Use a button to start capture and reset count ---
         if st.button("Start Capture", key="start_capture_btn"):
             st.session_state.capture_count = 0
             st.session_state.start_capture = True
@@ -279,31 +276,31 @@ elif mode == "Collect Data":
             progress_text = st.empty()
 
             if webrtc_ctx.state.playing:
-                while True: # Use a true loop that we can break
-                    with capture_lock:
-                        current_count = st.session_state.capture_count
+                # --- FIX: Removed blocking 'while True' loop ---
+                with capture_lock:
+                    current_count = st.session_state.capture_count
+                
+                progress = current_count / CAPTURE_COUNT if CAPTURE_COUNT > 0 else 0
+                progress_bar.progress(progress)
+                progress_text.text(f"Captured: {current_count}/{CAPTURE_COUNT}")
+                
+                if current_count >= CAPTURE_COUNT:
+                    progress_bar.progress(1.0)
+                    progress_text.success(f"Capture complete for {name}!")
                     
-                    progress = current_count / CAPTURE_COUNT if CAPTURE_COUNT > 0 else 0
-                    progress_bar.progress(progress)
-                    progress_text.text(f"Captured: {current_count}/{CAPTURE_COUNT}")
-                    
-                    if current_count >= CAPTURE_COUNT:
-                        progress_bar.progress(1.0)
-                        progress_text.success(f"Capture complete for {name}!")
-                        
-                        time.sleep(1.5) # Pause to show the message
-                        st.session_state.start_capture = False
-                        st.rerun() # Rerun the script, this will stop/remove the webrtc component
-                        break # Stop the status update loop
-                    
-                    if not webrtc_ctx.state.playing: # Check if user stopped it manually
-                        st.session_state.start_capture = False
-                        break
-
+                    time.sleep(1.5) # Pause to show the message
+                    st.session_state.start_capture = False
+                    st.rerun() # Rerun the script, this will stop/remove the webrtc component
+                
+                elif not webrtc_ctx.state.playing: # Check if user stopped it manually
+                    st.session_state.start_capture = False
+                    st.rerun() # Rerun to clear the state
+                else:
                     time.sleep(0.1) # Poll for updates
+                    st.rerun() # Rerun to check again
+                # --- END FIX ---
             else:
                 st.caption("Press the 'STOP' button on the video stream if you want to stop early.")
-        # --- END FIX ---
 
 
 # --- Mode: Consolidate Data ---
@@ -399,11 +396,9 @@ elif mode == "Train Model":
                     labels_categorical = to_categorical(labels_encoded)
                     num_classes = labels_categorical.shape[1]
 
-                    # --- FIX: Save just the classes array ---
                     with open(LE_PKL, 'wb') as f:
                         pickle.dump(le.classes_, f)
                     st.info(f"Label encoder classes saved to {LE_PKL}")
-                    # --- End Fix ---
 
                     # Preprocess images for CNN
                     images_processed = images.reshape(images.shape[0], IMG_SIZE[0], IMG_SIZE[1], 1)
@@ -506,7 +501,6 @@ elif mode == "Recognize & Mark Attendance":
         else:
             st.warning(f"Model file '{MODEL_FILE}' not found. Please train the model first.")
 
-        # --- FIX: Load just the classes_ array ---
         if os.path.exists(LE_PKL):
             with open(LE_PKL, 'rb') as f:
                 saved_classes = pickle.load(f)
@@ -515,7 +509,6 @@ elif mode == "Recognize & Mark Attendance":
             st.info(f"Label encoder loaded. Classes: {list(label_encoder.classes_)}")
         else:
             st.warning(f"Label encoder '{LE_PKL}' not found. Please train the model first.")
-        # --- End Fix ---
 
     except Exception as e:
         st.error(f"Error loading model or label encoder: {e}")
@@ -541,11 +534,6 @@ elif mode == "Recognize & Mark Attendance":
 
     display_attendance() # Initial display
     
-    # --- FIX: Put Result Queue in session_state ---
-    if 'result_queue' not in st.session_state:
-        st.session_state.result_queue = queue.Queue()
-    # --- END FIX ---
-
     # --- Video Transformer Class ---
     class VideoRecognizer(VideoTransformerBase):
         def __init__(self, model, le, queue_out):
@@ -612,7 +600,7 @@ elif mode == "Recognize & Mark Attendance":
         webrtc_ctx = webrtc_streamer(
             key="recognize",
             mode=WebRtcMode.SENDRECV,
-            # --- FIX: Pass the persistent queue from session_state ---
+            # Pass the persistent queue from session_state
             video_transformer_factory=lambda: VideoRecognizer(model, label_encoder, st.session_state.result_queue),
             media_stream_constraints={"video": True, "audio": False},
             async_processing=True,
