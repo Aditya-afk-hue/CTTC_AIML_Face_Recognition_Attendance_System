@@ -5,3 +5,5 @@ pandas
 tensorflow
 scikit-learn
 matplotlib
+streamlit-webrtc
+av
